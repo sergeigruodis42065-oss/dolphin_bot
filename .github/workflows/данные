@@ -1,0 +1,270 @@
+require('dotenv').config();
+const express = require('express');
+const { Telegraf } = require('telegraf');
+const crypto = require('crypto');
+const { Pool } = require('pg');
+const Redis = require('ioredis');
+
+const app = express();
+app.use(express.json());
+
+// ─── Database ───────────────────────────────────────────────
+const db = new Pool({ connectionString: process.env.DATABASE_URL });
+
+// ─── Redis ───────────────────────────────────────────────────
+const redis = new Redis(process.env.REDIS_URL);
+
+// ─── Telegram Bot ────────────────────────────────────────────
+const bot = new Telegraf(process.env.BOT_TOKEN);
+
+// Валидация initData от Telegram WebApp
+function validateTelegramData(initData) {
+  const params = new URLSearchParams(initData);
+  const hash = params.get('hash');
+  params.delete('hash');
+  const dataCheckString = [...params.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
+  const secret = crypto
+    .createHmac('sha256', 'WebAppData')
+    .update(process.env.BOT_TOKEN)
+    .digest();
+  const expectedHash = crypto
+    .createHmac('sha256', secret)
+    .update(dataCheckString)
+    .digest('hex');
+  return expectedHash === hash;
+}
+
+// ─── Middleware: проверка подписи ────────────────────────────
+function authMiddleware(req, res, next) {
+  const initData = req.headers['x-telegram-init-data'];
+  if (!initData || !validateTelegramData(initData)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const params = new URLSearchParams(initData);
+  req.telegramUser = JSON.parse(params.get('user') || '{}');
+  next();
+}
+
+// ─── API: Аттракционы ────────────────────────────────────────
+app.get('/api/activities', async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      'SELECT * FROM activities WHERE active = true ORDER BY sort_order'
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── API: Доступные слоты ────────────────────────────────────
+app.get('/api/slots', async (req, res) => {
+  const { activity_id, date } = req.query;
+  if (!activity_id || !date) {
+    return res.status(400).json({ error: 'activity_id и date обязательны' });
+  }
+  try {
+    const { rows } = await db.query(
+      `SELECT s.*, 
+        (s.capacity - COALESCE(b.booked, 0)) AS available
+       FROM slots s
+       LEFT JOIN (
+         SELECT slot_id, SUM(people_count) AS booked
+         FROM bookings WHERE status != 'cancelled'
+         GROUP BY slot_id
+       ) b ON b.slot_id = s.id
+       WHERE s.activity_id = $1 AND s.date = $2
+       ORDER BY s.time`,
+      [activity_id, date]
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── API: Новости ────────────────────────────────────────────
+app.get('/api/news', async (req, res) => {
+  const { limit = 10, offset = 0 } = req.query;
+  try {
+    const { rows } = await db.query(
+      'SELECT * FROM news WHERE published = true ORDER BY created_at DESC LIMIT $1 OFFSET $2',
+      [limit, offset]
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── API: События ────────────────────────────────────────────
+app.get('/api/events', async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      'SELECT * FROM events WHERE event_date >= NOW() ORDER BY event_date ASC'
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── API: Создание брони ─────────────────────────────────────
+app.post('/api/bookings', authMiddleware, async (req, res) => {
+  const { activity_id, slot_id, people_count, promo_code } = req.body;
+  const telegram_id = req.telegramUser.id;
+
+  try {
+    // Проверка промокода
+    let discount = 0;
+    if (promo_code) {
+      const { rows: promos } = await db.query(
+        'SELECT * FROM promo_codes WHERE code = $1 AND active = true AND (expires_at IS NULL OR expires_at > NOW())',
+        [promo_code.toUpperCase()]
+      );
+      if (promos.length > 0) discount = promos[0].discount;
+    }
+
+    // Проверка свободных мест
+    const { rows: slots } = await db.query(
+      `SELECT s.price, (s.capacity - COALESCE(b.booked,0)) AS available
+       FROM slots s
+       LEFT JOIN (
+         SELECT slot_id, SUM(people_count) AS booked
+         FROM bookings WHERE status != 'cancelled' GROUP BY slot_id
+       ) b ON b.slot_id = s.id
+       WHERE s.id = $1`,
+      [slot_id]
+    );
+    if (!slots.length || slots[0].available < people_count) {
+      return res.status(409).json({ error: 'Нет свободных мест' });
+    }
+
+    const price = slots[0].price;
+    const total = Math.round(price * people_count * (1 - discount));
+    const bookingId = `DLF-${new Date().getFullYear()}-${String(Date.now()).slice(-5)}`;
+
+    // Сохранение брони
+    const { rows: booking } = await db.query(
+      `INSERT INTO bookings
+        (booking_id, telegram_id, activity_id, slot_id, people_count, promo_code, discount, total, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'confirmed') RETURNING *`,
+      [bookingId, telegram_id, activity_id, slot_id, people_count, promo_code || null, discount, total]
+    );
+
+    // Push-уведомление пользователю
+    await bot.telegram.sendMessage(
+      telegram_id,
+      `✅ Бронь подтверждена!\n\nID: #${bookingId}\nСумма: ${total.toLocaleString('ru')} ₽\n\nДо встречи на пляже «Дельфин»! 🏄`
+    );
+
+    // Кэш для быстрого QR
+    await redis.setex(`booking:${bookingId}`, 86400, JSON.stringify(booking[0]));
+
+    res.json({ success: true, booking: booking[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── API: Брони пользователя ─────────────────────────────────
+app.get('/api/bookings/my', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT b.*, a.name AS activity_name, a.emoji,
+              s.date, s.time
+       FROM bookings b
+       JOIN activities a ON a.id = b.activity_id
+       JOIN slots s ON s.id = b.slot_id
+       WHERE b.telegram_id = $1
+       ORDER BY s.date DESC`,
+      [req.telegramUser.id]
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── API: Отмена брони ───────────────────────────────────────
+app.patch('/api/bookings/:id/cancel', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `UPDATE bookings SET status='cancelled'
+       WHERE booking_id=$1 AND telegram_id=$2 AND status='confirmed'
+       RETURNING *`,
+      [req.params.id, req.telegramUser.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Бронь не найдена' });
+
+    await bot.telegram.sendMessage(
+      req.telegramUser.id,
+      `❌ Бронь #${req.params.id} отменена.`
+    );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Webhook от бота ─────────────────────────────────────────
+app.post('/webhook', (req, res) => {
+  bot.handleUpdate(req.body);
+  res.sendStatus(200);
+});
+
+// ─── Bot: обработка данных из WebApp ─────────────────────────
+bot.on('web_app_data', async (ctx) => {
+  const data = JSON.parse(ctx.webAppData.data);
+
+  switch (data.action) {
+    case 'go_home':
+      await ctx.reply('Возвращаемся на главную 🏠');
+      break;
+    case 'add_to_calendar':
+      await ctx.reply(
+        `📅 Событие добавлено!\n\n🏄 ${data.activity}\n📆 ${data.date} в ${data.time}`
+      );
+      break;
+    case 'show_qr':
+      await ctx.reply(`QR-код для брони #${data.booking_id} 📱`);
+      break;
+    case 'cancel_booking':
+      await ctx.reply(`Бронь #${data.booking_id} будет отменена.`);
+      break;
+    default:
+      await ctx.reply(`Действие: ${data.action}`);
+  }
+});
+
+bot.start((ctx) =>
+  ctx.reply(
+    `Привет, ${ctx.from.first_name}! 👋\n\nДобро пожаловать в пляж «Дельфин» 🏖\nЗабронируй аттракцион прямо здесь:`,
+    {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '🌊 Открыть приложение', web_app: { url: process.env.WEBHOOK_URL?.replace('/webhook', '') } }
+        ]]
+      }
+    }
+  )
+);
+
+// ─── Запуск ───────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+  console.log(`Server running on port ${PORT}`);
+  if (process.env.NODE_ENV === 'production') {
+    await bot.telegram.setWebhook(`${process.env.WEBHOOK_URL}`);
+    console.log('Webhook set');
+  } else {
+    bot.launch();
+    console.log('Bot polling started');
+  }
+});
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
