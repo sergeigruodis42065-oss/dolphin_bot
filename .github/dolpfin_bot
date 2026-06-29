@@ -1,0 +1,220 @@
+require('dotenv').config();
+const express = require('express');
+const axios = require('axios');
+const path = require('path');
+
+const app = express();
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
+
+// ── Системный промпт для ИИ-ассистента ──────────────────────────────────────
+const SYSTEM_PROMPT = `Ты — ИИ-ассистент пляжа «Дельфин». Помогаешь клиентам:
+- отвечаешь на вопросы об аттракционах (сапборды, катамараны, вейкборд, водные лыжи);
+- рассказываешь о ценах, акциях и промокодах;
+- помогаешь с бронированием (направляешь на кнопку «Забронировать»);
+- информируешь о расписании мероприятий и событий;
+- объясняешь правила безопасности.
+Отвечай кратко, дружелюбно, на русском языке. Если не знаешь точного ответа — предлагай связаться с администратором.`;
+
+// ── Установка вебхука ────────────────────────────────────────────────────────
+async function setWebhook() {
+  try {
+    const url = `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`;
+    const res = await axios.post(url, {
+      url: `${WEBHOOK_URL}/webhook`,
+      allowed_updates: ['message', 'callback_query']
+    });
+    console.log('Webhook set:', res.data);
+  } catch (err) {
+    console.error('Webhook error:', err.message);
+  }
+}
+
+// ── Отправка сообщения ───────────────────────────────────────────────────────
+async function sendMessage(chatId, text, options = {}) {
+  await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+    chat_id: chatId,
+    text,
+    parse_mode: 'HTML',
+    ...options
+  });
+}
+
+// ── ИИ-ответ через OpenAI ────────────────────────────────────────────────────
+async function getAIResponse(userMessage) {
+  const response = await axios.post(
+    'https://api.openai.com/v1/chat/completions',
+    {
+      model: 'gpt-4o',
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: userMessage }
+      ],
+      max_tokens: 500,
+      temperature: 0.7
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    }
+  );
+  return response.data.choices[0].message.content;
+}
+
+// ── Вебхук Telegram ──────────────────────────────────────────────────────────
+app.post('/webhook', async (req, res) => {
+  res.sendStatus(200); // сразу отвечаем Telegram
+
+  const body = req.body;
+
+  // Обработка callback_query (кнопки)
+  if (body.callback_query) {
+    const query = body.callback_query;
+    const chatId = query.message.chat.id;
+    const data = query.data;
+
+    await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+      callback_query_id: query.id
+    });
+
+    if (data === 'book') {
+      await sendMessage(chatId,
+        '📅 <b>Бронирование</b>\n\nВыбери аттракцион:',
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🏄 Сапборд', callback_data: 'book_sup' }],
+              [{ text: '⛵ Катамаран', callback_data: 'book_cat' }],
+              [{ text: '🎿 Водные лыжи', callback_data: 'book_ski' }],
+              [{ text: '🤿 Вейкборд', callback_data: 'book_wake' }]
+            ]
+          }
+        }
+      );
+    } else if (data.startsWith('book_')) {
+      const activities = {
+        book_sup: 'Сапборд — 600 ₽/час',
+        book_cat: 'Катамаран — 800 ₽/час',
+        book_ski: 'Водные лыжи — 700 ₽/20 мин',
+        book_wake: 'Вейкборд — 1200 ₽/час'
+      };
+      const activity = activities[data] || 'Аттракцион';
+      await sendMessage(chatId,
+        `✅ <b>${activity}</b>\n\nОткрываю мини-приложение для выбора времени 👇`,
+        {
+          reply_markup: {
+            inline_keyboard: [[
+              {
+                text: '📲 Открыть приложение',
+                web_app: { url: WEBHOOK_URL }
+              }
+            ]]
+          }
+        }
+      );
+    } else if (data === 'ai_help') {
+      await sendMessage(chatId,
+        '🤖 <b>ИИ-ассистент</b>\n\nЗадай любой вопрос о пляже «Дельфин» — я отвечу!'
+      );
+    }
+    return;
+  }
+
+  // Обработка сообщений
+  if (!body.message) return;
+
+  const msg = body.message;
+  const chatId = msg.chat.id;
+  const text = msg.text || '';
+  const firstName = msg.from?.first_name || 'Гость';
+
+  // /start
+  if (text === '/start') {
+    await sendMessage(chatId,
+      `🐬 <b>Добро пожаловать на пляж «Дельфин», ${firstName}!</b>\n\n` +
+      `Здесь ты можешь:\n` +
+      `🏄 Забронировать аттракцион\n` +
+      `📅 Посмотреть события и акции\n` +
+      `🤖 Задать вопрос ИИ-ассистенту\n\n` +
+      `Выбери действие:`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '🏄 Забронировать', callback_data: 'book' },
+              { text: '🤖 Спросить ИИ', callback_data: 'ai_help' }
+            ],
+            [
+              {
+                text: '📲 Открыть мини-приложение',
+                web_app: { url: WEBHOOK_URL }
+              }
+            ]
+          ]
+        }
+      }
+    );
+    return;
+  }
+
+  // Команда /ai или текстовый вопрос
+  if (text.startsWith('/ai ') || (!text.startsWith('/') && text.length > 0)) {
+    const question = text.startsWith('/ai ') ? text.slice(4) : text;
+
+    try {
+      // Показываем статус "печатает..."
+      await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`, {
+        chat_id: chatId,
+        action: 'typing'
+      });
+
+      const aiReply = await getAIResponse(question);
+
+      await sendMessage(chatId,
+        `🤖 <b>ИИ-ассистент:</b>\n\n${aiReply}`,
+        {
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '🏄 Забронировать', callback_data: 'book' },
+              {
+                text: '📲 Открыть приложение',
+                web_app: { url: WEBHOOK_URL }
+              }
+            ]]
+          }
+        }
+      );
+    } catch (err) {
+      console.error('AI error:', err.message);
+      await sendMessage(chatId,
+        '⚠️ Не удалось получить ответ от ИИ. Попробуй ещё раз или обратись к администратору.'
+      );
+    }
+    return;
+  }
+
+  // Неизвестная команда
+  await sendMessage(chatId,
+    '🤷 Не понял команду. Попробуй /start или просто задай вопрос!'
+  );
+});
+
+// ── Health check ─────────────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', bot: 'Дельфин на связи' });
+});
+
+// ── Запуск ───────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+  console.log(`Server running on port ${PORT}`);
+  if (BOT_TOKEN && WEBHOOK_URL) {
+    await setWebhook();
+  }
+});
